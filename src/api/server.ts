@@ -640,7 +640,7 @@ function discoverPluginsFromManifest(config?: MilaidyConfig): PluginEntry[] {
       const index = JSON.parse(
         fs.readFileSync(manifestPath, "utf-8"),
       ) as PluginIndex;
-      return index.plugins
+      const discovered = index.plugins
         .map((p) => {
           const category = categorizePlugin(p.id);
           const envKey = p.envKey;
@@ -685,6 +685,55 @@ function discoverPluginsFromManifest(config?: MilaidyConfig): PluginEntry[] {
           };
         })
         .sort((a, b) => a.name.localeCompare(b.name));
+
+      // Ensure Eliza Cloud appears in AI Settings even if registry metadata
+      // shape drifts or plugin indexing misses it in some builds.
+      if (!discovered.some((p) => p.id === "elizacloud")) {
+        const storedEntry = config?.plugins?.entries?.elizacloud;
+        const storedConfig = storedEntry?.config ?? {};
+        const hasStoredConfig = Object.keys(storedConfig).length > 0;
+        const envKey = "ELIZAOS_CLOUD_API_KEY";
+        const parameters = buildParamDefs({
+          ELIZAOS_CLOUD_API_KEY: {
+            type: "string",
+            description: "Eliza Cloud API key",
+            required: true,
+            sensitive: true,
+          },
+        });
+        const validation = validatePluginConfig(
+          "elizacloud",
+          "ai-provider",
+          envKey,
+          [envKey],
+          undefined,
+          [
+            {
+              key: envKey,
+              required: true,
+              sensitive: true,
+              type: "string",
+              description: "Eliza Cloud API key",
+              default: undefined,
+            },
+          ],
+        );
+        discovered.push({
+          id: "elizacloud",
+          name: "Eliza Cloud",
+          description: "Managed cloud models and services.",
+          enabled: storedEntry?.enabled ?? false,
+          configured: Boolean(process.env[envKey]) || hasStoredConfig,
+          envKey,
+          category: "ai-provider",
+          configKeys: [envKey],
+          parameters,
+          validationErrors: validation.errors,
+          validationWarnings: validation.warnings,
+        });
+      }
+
+      return discovered.sort((a, b) => a.name.localeCompare(b.name));
     } catch (err) {
       logger.debug(
         `[milaidy-api] Failed to read plugins.json: ${err instanceof Error ? err.message : err}`,
@@ -833,6 +882,8 @@ function categorizePlugin(
   id: string,
 ): "ai-provider" | "connector" | "database" | "feature" {
   const aiProviders = [
+    "elizacloud",
+    "eliza-cloud",
     "openai",
     "anthropic",
     "groq",
@@ -2170,6 +2221,14 @@ function getProviderOptions(): Array<{
   description: string;
 }> {
   return [
+    {
+      id: "elizacloud",
+      name: "Eliza Cloud",
+      envKey: "ELIZAOS_CLOUD_API_KEY",
+      pluginName: "@elizaos/plugin-elizacloud",
+      keyPrefix: null,
+      description: "Managed cloud models and services.",
+    },
     {
       id: "anthropic",
       name: "Anthropic",
@@ -4542,11 +4601,14 @@ async function handleRequest(
     if (!state.config.env) state.config.env = {};
 
     const generated: Array<{ chain: WalletChain; address: string }> = [];
+    let generatedEvmAddress: string | null = null;
+    let generatedSolanaAddress: string | null = null;
 
     if (targetChain === "both" || targetChain === "evm") {
       const result = generateWalletForChain("evm");
       process.env.EVM_PRIVATE_KEY = result.privateKey;
       generated.push({ chain: "evm", address: result.address });
+      generatedEvmAddress = result.address;
       logger.info(`[milaidy-api] Generated EVM wallet: ${result.address}`);
       // Set as active connected wallet when generating a single-chain wallet.
       if (targetChain === "evm") {
@@ -4562,6 +4624,7 @@ async function handleRequest(
       const result = generateWalletForChain("solana");
       process.env.SOLANA_PRIVATE_KEY = result.privateKey;
       generated.push({ chain: "solana", address: result.address });
+      generatedSolanaAddress = result.address;
       logger.info(`[milaidy-api] Generated Solana wallet: ${result.address}`);
       // Set as active connected wallet when generating a single-chain wallet.
       if (targetChain === "solana") {
@@ -4570,6 +4633,24 @@ async function handleRequest(
         (state.config.env as Record<string, string>).SOLANA_ADDRESS =
           result.address;
         delete (state.config.env as Record<string, string>).EVM_ADDRESS;
+      }
+    }
+
+    // Ensure "both" generation still leaves one active connected wallet so
+    // UI connect/disconnect and portfolio flows don't end up in a limbo state.
+    if (targetChain === "both") {
+      if (generatedSolanaAddress) {
+        process.env.SOLANA_ADDRESS = generatedSolanaAddress;
+        delete process.env.EVM_ADDRESS;
+        (state.config.env as Record<string, string>).SOLANA_ADDRESS =
+          generatedSolanaAddress;
+        delete (state.config.env as Record<string, string>).EVM_ADDRESS;
+      } else if (generatedEvmAddress) {
+        process.env.EVM_ADDRESS = generatedEvmAddress;
+        delete process.env.SOLANA_ADDRESS;
+        (state.config.env as Record<string, string>).EVM_ADDRESS =
+          generatedEvmAddress;
+        delete (state.config.env as Record<string, string>).SOLANA_ADDRESS;
       }
     }
 
@@ -4619,6 +4700,8 @@ async function handleRequest(
   if (method === "PUT" && pathname === "/api/wallet/config") {
     const body = await readJsonBody<Record<string, string>>(req, res);
     if (!body) return;
+    const explicitDisconnect =
+      body.WALLET_DISCONNECT === "1" || body.DISCONNECT_WALLET === "1";
     const nextEvmAddress =
       typeof body.EVM_ADDRESS === "string"
         ? normalizeConfiguredEvmAddress(body.EVM_ADDRESS)
@@ -4674,6 +4757,14 @@ async function handleRequest(
     }
 
     if (userCtx && multiUserService) {
+      if (explicitDisconnect) {
+        multiUserService.setWalletBinding(userCtx.userId, {
+          evmAddress: null,
+          solanaAddress: null,
+        });
+        json(res, { ok: true });
+        return;
+      }
       // User-scoped: persist only wallet addresses per user, never shared infra keys.
       const hasEvmField = Object.prototype.hasOwnProperty.call(
         body,
@@ -4702,6 +4793,21 @@ async function handleRequest(
         }
       }
     } else {
+      if (explicitDisconnect) {
+        delete process.env.EVM_ADDRESS;
+        delete process.env.SOLANA_ADDRESS;
+        if (state.config.env) {
+          delete (state.config.env as Record<string, string>).EVM_ADDRESS;
+          delete (state.config.env as Record<string, string>).SOLANA_ADDRESS;
+        }
+        try {
+          saveMilaidyConfig(state.config);
+        } catch {
+          // Config path may not be writable in test environments
+        }
+        json(res, { ok: true });
+        return;
+      }
       const allowedKeys = [
         "ALCHEMY_API_KEY",
         "HELIUS_API_KEY",
