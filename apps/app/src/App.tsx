@@ -88,6 +88,7 @@ export function App() {
   );
   const [mobileConversationsOpen, setMobileConversationsOpen] = useState(false);
   const [mobileAutonomousOpen, setMobileAutonomousOpen] = useState(false);
+  const [startingTimedOut, setStartingTimedOut] = useState(false);
 
   const isChat = tab === "chat";
   const isAdvancedTab =
@@ -225,16 +226,29 @@ export function App() {
 
   const agentStarting = agentStatus?.state === "starting";
 
-  if (onboardingLoading || agentStarting) {
+  useEffect(() => {
+    if (!agentStarting) {
+      setStartingTimedOut(false);
+      return;
+    }
+    const t = setTimeout(() => {
+      setStartingTimedOut(true);
+    }, 20000);
+    return () => clearTimeout(t);
+  }, [agentStarting]);
+
+  // Never block onboarding behind startup splash.
+  // If setup is incomplete, always show onboarding immediately.
+  if (authRequired) return <PairingView />;
+  if (!onboardingComplete) return <OnboardingWizard />;
+
+  if (onboardingLoading || (agentStarting && !startingTimedOut)) {
     return (
       <LoadingScreen
         phase={agentStarting ? "initializing-agent" : startupPhase}
       />
     );
   }
-
-  if (authRequired) return <PairingView />;
-  if (!onboardingComplete) return <OnboardingWizard />;
 
   return (
     <>

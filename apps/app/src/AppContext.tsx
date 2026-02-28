@@ -3744,8 +3744,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setStartupPhase("starting-backend");
 
       // Keep the splash screen up until the backend is reachable.
+      // Hard cap retries so the UI can fail open instead of hanging forever.
+      const MAX_BACKEND_ATTEMPTS = 60;
       let backendAttempts = 0;
-      while (!cancelled) {
+      while (!cancelled && backendAttempts < MAX_BACKEND_ATTEMPTS) {
         try {
           const auth = await client.getAuthStatus();
           if (auth.required && !client.hasToken()) {
@@ -3771,6 +3773,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (cancelled) {
         return;
       }
+      if (backendAttempts >= MAX_BACKEND_ATTEMPTS) {
+        setConnected(false);
+        setOnboardingComplete(false);
+        setOnboardingLoading(false);
+        setActionNotice(
+          "Backend did not respond in time. Open Settings after load and retry runtime start.",
+          "info",
+          10000,
+        );
+        return;
+      }
 
       if (requiresAuth) {
         setOnboardingLoading(false);
@@ -3781,17 +3794,27 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       // On fresh installs, unblock to onboarding as soon as options are available.
       if (onboardingNeedsOptions) {
+        const MAX_OPTIONS_ATTEMPTS = 40;
+        let optionsAttempts = 0;
         let optionsLoaded = false;
-        while (!cancelled && !optionsLoaded) {
+        while (!cancelled && !optionsLoaded && optionsAttempts < MAX_OPTIONS_ATTEMPTS) {
           try {
             const options = await client.getOnboardingOptions();
             setOnboardingOptions(options);
             optionsLoaded = true;
           } catch {
+            optionsAttempts += 1;
             await sleep(500);
           }
         }
         if (!cancelled) {
+          if (!optionsLoaded) {
+            setActionNotice(
+              "Setup options are unavailable. You can still open the app and configure providers in Settings.",
+              "info",
+              10000,
+            );
+          }
           setOnboardingLoading(false);
         }
         return;
@@ -3799,8 +3822,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       // Existing installs: keep loading until the runtime reports ready.
       let agentReady = false;
+      const MAX_AGENT_ATTEMPTS = 120;
       let _agentAttempts = 0;
-      while (!cancelled) {
+      while (!cancelled && _agentAttempts < MAX_AGENT_ATTEMPTS) {
         try {
           let status = await client.getStatus();
           setAgentStatus(status);
@@ -3840,6 +3864,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
 
       setOnboardingLoading(false);
+      if (!agentReady) {
+        setActionNotice(
+          "Agent is still starting. App is available; configure provider keys in Settings if needed.",
+          "info",
+          8000,
+        );
+      }
 
       // Load conversations — if none exist, create one and request a greeting
       let greetConvId: string | null = null;
