@@ -1,13 +1,16 @@
 import { logger } from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureApiTokenForBindHost } from "./server";
+import { ensureApiTokenForBindHost, getConfiguredLegacyApiToken } from "./server";
 
 describe("ensureApiTokenForBindHost", () => {
   const previousToken = process.env.MILADY_API_TOKEN;
+  const previousCompatToken = process.env.MILAIDY_API_TOKEN;
 
   afterEach(() => {
     if (previousToken === undefined) delete process.env.MILADY_API_TOKEN;
     else process.env.MILADY_API_TOKEN = previousToken;
+    if (previousCompatToken === undefined) delete process.env.MILAIDY_API_TOKEN;
+    else process.env.MILAIDY_API_TOKEN = previousCompatToken;
     vi.restoreAllMocks();
   });
 
@@ -38,5 +41,17 @@ describe("ensureApiTokenForBindHost", () => {
     expect(loggedMessages.some((message) => message.includes(generated))).toBe(
       false,
     );
+  });
+
+  it("accepts compat token name for legacy auth", () => {
+    delete process.env.MILADY_API_TOKEN;
+    process.env.MILAIDY_API_TOKEN = "compat-token";
+    expect(getConfiguredLegacyApiToken()).toBe("compat-token");
+  });
+
+  it("prefers canonical token over compat token when both are set", () => {
+    process.env.MILADY_API_TOKEN = "canonical-token";
+    process.env.MILAIDY_API_TOKEN = "compat-token";
+    expect(getConfiguredLegacyApiToken()).toBe("canonical-token");
   });
 });

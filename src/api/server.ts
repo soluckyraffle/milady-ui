@@ -362,12 +362,20 @@ function isLoopbackBindHost(host: string): boolean {
 }
 
 export function ensureApiTokenForBindHost(host: string): void {
-  if (process.env.MILADY_API_TOKEN) return;
+  if (getConfiguredLegacyApiToken()) return;
   if (isLoopbackBindHost(host)) return;
   process.env.MILADY_API_TOKEN = crypto.randomBytes(32).toString("hex");
   logger.warn(
     "[milaidy-api] MILADY_API_TOKEN was auto-generated for non-loopback bind host",
   );
+}
+
+export function getConfiguredLegacyApiToken(): string | null {
+  const primary = process.env.MILADY_API_TOKEN?.trim();
+  if (primary) return primary;
+  const compat = process.env.MILAIDY_API_TOKEN?.trim();
+  if (compat) return compat;
+  return null;
 }
 
 function isAllowedWsOrigin(origin: string | undefined): boolean {
@@ -396,7 +404,7 @@ export function resolveWebSocketUpgradeRejection(
     return { status: 403, reason: "Origin not allowed" };
   }
 
-  const expected = process.env.MILADY_API_TOKEN;
+  const expected = getConfiguredLegacyApiToken();
   if (!expected || expected.length === 0) return null;
 
   const authHeader = req.headers.authorization;
@@ -447,6 +455,29 @@ export function isSafeResetStateDir(
   }
   const segments = resolvedTarget.split(path.sep).filter(Boolean);
   return segments.includes(".milady") || segments.includes("milaidy");
+}
+
+const BLOCKED_OBJECT_KEYS = new Set<string>([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+export function isBlockedObjectKey(key: string): boolean {
+  return BLOCKED_OBJECT_KEYS.has(key);
+}
+
+export function cloneWithoutBlockedObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => cloneWithoutBlockedObjectKeys(entry));
+  }
+  if (!value || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (isBlockedObjectKey(key)) continue;
+    out[key] = cloneWithoutBlockedObjectKeys(entry);
+  }
+  return out;
 }
 
 export function resolveWalletExportRejection(
@@ -1741,7 +1772,8 @@ async function readJsonBody<T = Record<string, unknown>>(
       error(res, "Request body must be a JSON object", 400);
       return null;
     }
-    return parsed as T;
+    const sanitized = cloneWithoutBlockedObjectKeys(parsed);
+    return sanitized as T;
   } catch {
     error(res, "Invalid JSON in request body", 400);
     return null;
@@ -2435,7 +2467,7 @@ const pairingAttempts = new Map<string, { count: number; resetAt: number }>();
 
 function pairingEnabled(): boolean {
   return (
-    Boolean(process.env.MILAIDY_API_TOKEN?.trim()) &&
+    Boolean(getConfiguredLegacyApiToken()) &&
     process.env.MILAIDY_PAIRING_DISABLED !== "1"
   );
 }
@@ -2490,6 +2522,10 @@ function extractAuthToken(req: http.IncomingMessage): string | null {
   }
 
   const header =
+    (typeof req.headers["x-runtime-token"] === "string" &&
+      req.headers["x-runtime-token"]) ||
+    (typeof req.headers["x-milady-token"] === "string" &&
+      req.headers["x-milady-token"]) ||
     (typeof req.headers["x-milaidy-token"] === "string" &&
       req.headers["x-milaidy-token"]) ||
     (typeof req.headers["x-api-key"] === "string" && req.headers["x-api-key"]);
@@ -2499,7 +2535,7 @@ function extractAuthToken(req: http.IncomingMessage): string | null {
 }
 
 function isAuthorized(req: http.IncomingMessage): boolean {
-  const expected = process.env.MILAIDY_API_TOKEN?.trim();
+  const expected = getConfiguredLegacyApiToken();
   if (!expected) return !REQUIRE_LEGACY_API_TOKEN;
   const provided = extractAuthToken(req);
   if (!provided) return false;
@@ -2640,7 +2676,7 @@ async function handleMultiUserV2Request(
       const body = await readJsonBody(req, res);
       if (!body) return true;
       const patch = multiUserService.parseTenantPatch(body);
-      json(res, multiUserService.patchSettings(ctx!.user.id, patch));
+      json(res, multiUserService.patchSettings(ctx!.user.id, patch, ctx!.user.role));
       return true;
     }
 
@@ -2690,7 +2726,10 @@ async function handleMultiUserV2Request(
       const body = await readJsonBody(req, res);
       if (!body) return true;
       const patch = multiUserService.parsePermissionPatch(body);
-      json(res, multiUserService.patchPermissions(ctx!.user.id, patch));
+      json(
+        res,
+        multiUserService.patchPermissions(ctx!.user.id, patch, ctx!.user.role),
+      );
       return true;
     }
 
@@ -2852,7 +2891,7 @@ async function handleRequest(
   const pathname = url.pathname;
   const isAuthEndpoint = pathname.startsWith("/api/auth/");
   const isV2Endpoint = pathname.startsWith("/api/v2/");
-  const hasLegacyApiToken = Boolean(process.env.MILAIDY_API_TOKEN?.trim());
+  const hasLegacyApiToken = Boolean(getConfiguredLegacyApiToken());
 
   if (!["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].includes(method)) {
     res.setHeader("Allow", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
@@ -2876,7 +2915,7 @@ async function handleRequest(
       res,
       {
         error:
-          "Legacy API token is required by server policy but MILAIDY_API_TOKEN is not set.",
+          "Legacy API token is required by server policy but MILADY_API_TOKEN (or MILAIDY_API_TOKEN) is not set.",
       },
       503,
     );
@@ -2929,7 +2968,7 @@ async function handleRequest(
 
   // ── GET /api/auth/status ───────────────────────────────────────────────
   if (method === "GET" && pathname === "/api/auth/status") {
-    const required = Boolean(process.env.MILAIDY_API_TOKEN?.trim());
+    const required = Boolean(getConfiguredLegacyApiToken());
     const enabled = pairingEnabled();
     if (enabled) ensurePairingCode();
     json(res, {
@@ -2945,7 +2984,7 @@ async function handleRequest(
     const body = await readJsonBody<{ code?: string }>(req, res);
     if (!body) return;
 
-    const token = process.env.MILAIDY_API_TOKEN?.trim();
+    const token = getConfiguredLegacyApiToken();
     if (!token) {
       error(res, "Pairing not enabled", 400);
       return;
@@ -3411,6 +3450,11 @@ async function handleRequest(
       // 2. Delete the state directory (~/.milaidy/) which contains
       //    config, workspace, memory, oauth tokens, etc.
       const stateDir = resolveStateDir();
+      const homeDir = process.env.HOME || process.env.USERPROFILE || "";
+      if (!isSafeResetStateDir(stateDir, homeDir)) {
+        error(res, `Unsafe reset path rejected: ${stateDir}`, 400);
+        return;
+      }
       if (fs.existsSync(stateDir)) {
         fs.rmSync(stateDir, { recursive: true, force: true });
       }

@@ -33,7 +33,7 @@ describe("MultiUserService execution backend", () => {
       integrationId: "solana-wallet",
       enabled: true,
       executionEnabled: true,
-    });
+    }, "owner");
 
     const res = await svc.executeAction(userId, {
       integrationId: "solana-wallet",
@@ -58,7 +58,7 @@ describe("MultiUserService execution backend", () => {
       integrationId: "solana-wallet",
       enabled: true,
       executionEnabled: true,
-    });
+    }, "owner");
 
     await expect(
       svc.executeAction(userId, {

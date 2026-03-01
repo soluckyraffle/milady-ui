@@ -225,15 +225,37 @@ function verifyPassword(password: string, stored: string): boolean {
 }
 
 function parseJsonObject(input: string): Record<string, unknown> {
+  const blocked = new Set(["__proto__", "constructor", "prototype"]);
+  const stripBlockedKeys = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map((entry) => stripBlockedKeys(entry));
+    if (!value || typeof value !== "object") return value;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (blocked.has(key)) continue;
+      out[key] = stripBlockedKeys(entry);
+    }
+    return out;
+  };
   try {
     const parsed: unknown = JSON.parse(input);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
+      return stripBlockedKeys(parsed) as Record<string, unknown>;
     }
   } catch {
     // ignored
   }
   return {};
+}
+
+function constantTimeStringEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a, "utf8");
+  const right = Buffer.from(b, "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function canManageSecurityPolicies(role: UserRole): boolean {
+  return role === "owner" || role === "admin";
 }
 
 function parseActionExecuteRequest(
@@ -351,6 +373,7 @@ export class MultiUserService {
   private readonly snapshotPath: string;
   private readonly sqlitePath: string;
   private sqliteDb: SqliteDbLike | null = null;
+  private readonly isProductionRuntime: boolean;
   private readonly blockSimulatedExecution: boolean;
   private readonly requireUserProviderSecret: boolean;
   private executionBackend: ExecutionBackend | null = null;
@@ -390,6 +413,7 @@ export class MultiUserService {
     const isProductionRuntime =
       process.env.MILAIDY_ENV === "production" ||
       process.env.NODE_ENV === "production";
+    this.isProductionRuntime = isProductionRuntime;
     const requestedStore = (process.env.MILAIDY_MULTIUSER_STORE ?? "")
       .trim()
       .toLowerCase();
@@ -413,8 +437,9 @@ export class MultiUserService {
     this.sqlitePath =
       process.env.MILAIDY_MULTIUSER_DB_PATH?.trim() ||
       path.join(resolveStateDir(), "multiuser-store.v1.sqlite");
-    this.blockSimulatedExecution =
-      process.env.MILAIDY_MULTIUSER_BLOCK_SIMULATED_EXECUTION === "1";
+    this.blockSimulatedExecution = isProductionRuntime
+      ? process.env.MILAIDY_MULTIUSER_BLOCK_SIMULATED_EXECUTION !== "0"
+      : process.env.MILAIDY_MULTIUSER_BLOCK_SIMULATED_EXECUTION === "1";
     this.requireUserProviderSecret =
       process.env.MILAIDY_REQUIRE_USER_PROVIDER_SECRET !== "0";
 
@@ -1230,8 +1255,19 @@ export class MultiUserService {
     return settings;
   }
 
-  patchSettings(userId: string, patch: TenantSettingsUpdate): TenantSettings {
+  patchSettings(
+    userId: string,
+    patch: TenantSettingsUpdate,
+    actorRole: UserRole,
+  ): TenantSettings {
     const settings = this.getSettings(userId);
+    if (patch.policies && !canManageSecurityPolicies(actorRole)) {
+      throw new MultiUserError(
+        "Permission denied",
+        403,
+        "FORBIDDEN",
+      );
+    }
     if (patch.persona) {
       settings.persona = {
         personaName: patch.persona.personaName,
@@ -1359,11 +1395,15 @@ export class MultiUserService {
   patchPermissions(
     userId: string,
     patch: PermissionPatchRequest,
+    actorRole: UserRole,
   ): {
     integrations: IntegrationPermissions[];
     polymarket: PolymarketPermissions;
   } {
     const settings = this.getSettings(userId);
+    if (!canManageSecurityPolicies(actorRole)) {
+      throw new MultiUserError("Permission denied", 403, "FORBIDDEN");
+    }
     if (!settings.policies.canManagePermissions) {
       throw new MultiUserError("Permission denied", 403, "FORBIDDEN");
     }
@@ -1657,7 +1697,10 @@ export class MultiUserService {
           requiresConfirmation: true,
           expiresInSeconds: this.confirmationTtlSec,
         };
-        if (process.env.MILAIDY_EXPOSE_CONFIRM_CODE === "1") {
+        if (
+          process.env.MILAIDY_EXPOSE_CONFIRM_CODE === "1" &&
+          !this.isProductionRuntime
+        ) {
           resp.confirmationCode = code;
         }
         return resp;
@@ -1690,7 +1733,7 @@ export class MultiUserService {
       );
     }
     const provided = sha256Hex(req.confirmationCode.trim());
-    if (provided !== pending.codeHash) {
+    if (!constantTimeStringEqual(provided, pending.codeHash)) {
       pending.failedAttempts += 1;
       if (pending.failedAttempts >= this.maxConfirmAttempts) {
         this.pendingConfirmationsByJobId.delete(req.executionJobId);
