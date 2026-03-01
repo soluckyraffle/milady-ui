@@ -32,6 +32,7 @@ export class InMemoryExecutionQueue<TPayload = unknown>
   private readonly queue: Array<ExecutionTask<TPayload>> = [];
   private readonly inFlight = new Set<string>();
   private readonly dedupeKeys = new Set<string>();
+  private readonly dedupeKeyByTaskId = new Map<string, string>();
   private readonly maxQueued: number;
 
   constructor(opts?: { maxQueued?: number }) {
@@ -43,7 +44,10 @@ export class InMemoryExecutionQueue<TPayload = unknown>
     if (task.dedupeKey && this.dedupeKeys.has(task.dedupeKey)) return false;
 
     this.queue.push(task);
-    if (task.dedupeKey) this.dedupeKeys.add(task.dedupeKey);
+    if (task.dedupeKey) {
+      this.dedupeKeys.add(task.dedupeKey);
+      this.dedupeKeyByTaskId.set(task.id, task.dedupeKey);
+    }
     return true;
   }
 
@@ -56,6 +60,11 @@ export class InMemoryExecutionQueue<TPayload = unknown>
 
   markDone(taskId: string): void {
     this.inFlight.delete(taskId);
+    const dedupeKey = this.dedupeKeyByTaskId.get(taskId);
+    if (dedupeKey) {
+      this.dedupeKeys.delete(dedupeKey);
+      this.dedupeKeyByTaskId.delete(taskId);
+    }
   }
 
   /**
@@ -66,6 +75,7 @@ export class InMemoryExecutionQueue<TPayload = unknown>
     if (idx < 0) return;
     const [task] = this.queue.splice(idx, 1);
     if (task?.dedupeKey) this.dedupeKeys.delete(task.dedupeKey);
+    this.dedupeKeyByTaskId.delete(taskId);
   }
 
   stats(): ExecutionQueueStats {

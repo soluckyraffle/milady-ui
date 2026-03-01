@@ -35,6 +35,29 @@ describe("InMemoryExecutionQueue", () => {
     expect(dupe).toBe(false);
   });
 
+  it("releases dedupe key after task completion", () => {
+    const queue = new InMemoryExecutionQueue();
+    queue.enqueue({
+      id: "a",
+      userId: "u1",
+      dedupeKey: "bet:1",
+      payload: {},
+      createdAt: 1,
+    });
+    const task = queue.dequeue();
+    expect(task?.id).toBe("a");
+    queue.markDone("a");
+
+    const next = queue.enqueue({
+      id: "b",
+      userId: "u1",
+      dedupeKey: "bet:1",
+      payload: {},
+      createdAt: 2,
+    });
+    expect(next).toBe(true);
+  });
+
   it("enforces max queue size", () => {
     const queue = new InMemoryExecutionQueue({ maxQueued: 1 });
     const first = queue.enqueue({

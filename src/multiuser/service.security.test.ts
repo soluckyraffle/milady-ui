@@ -47,5 +47,71 @@ describe("MultiUserService RBAC security", () => {
       ),
     ).toThrow(/Permission denied/);
   });
-});
 
+  it("locks login after repeated failed attempts", async () => {
+    seedEnv();
+    process.env.MILAIDY_LOGIN_LOCKOUT_THRESHOLD = "3";
+    process.env.MILAIDY_LOGIN_LOCKOUT_MS = "600000";
+    const svc = new MultiUserService();
+    await svc.signup(
+      { email: "lockout@example.com", password: "pass1234", displayName: "L" },
+      { userAgent: null, ipAddress: "127.0.0.1" },
+    );
+
+    for (let i = 0; i < 3; i += 1) {
+      await expect(
+        svc.login(
+          { email: "lockout@example.com", password: "wrong-pass" },
+          { userAgent: null, ipAddress: "127.0.0.1" },
+        ),
+      ).rejects.toThrow();
+    }
+
+    await expect(
+      svc.login(
+        { email: "lockout@example.com", password: "pass1234" },
+        { userAgent: null, ipAddress: "127.0.0.1" },
+      ),
+    ).rejects.toThrow(/Too many failed login attempts/);
+  });
+
+  it("rejects invalid action format in execution requests", async () => {
+    seedEnv();
+    const svc = new MultiUserService();
+    expect(() =>
+      svc.parseActionExecute({
+        integrationId: "solana-wallet",
+        action: "wallet;rm -rf /",
+      }),
+    ).toThrow(/Invalid action format/);
+  });
+
+  it("blocks action execution when canUseTools is false", async () => {
+    seedEnv();
+    const svc = new MultiUserService();
+    const signup = await svc.signup(
+      { email: "tools-off@example.com", password: "pass1234", displayName: "T" },
+      { userAgent: null, ipAddress: "127.0.0.1" },
+    );
+    const userId = signup.user.id;
+    // Owner can set policies for this account; disable tool usage.
+    svc.patchSettings(userId, { policies: { canUseTools: false } }, "owner");
+    svc.patchPermissions(
+      userId,
+      {
+        integrationId: "solana-wallet",
+        enabled: true,
+        executionEnabled: true,
+      },
+      "owner",
+    );
+
+    await expect(
+      svc.executeAction(userId, {
+        integrationId: "solana-wallet",
+        action: "wallet.sign",
+        params: {},
+      }),
+    ).rejects.toThrow(/Tool execution is disabled/);
+  });
+});

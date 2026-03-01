@@ -261,14 +261,36 @@ function canManageSecurityPolicies(role: UserRole): boolean {
 function parseActionExecuteRequest(
   body: Record<string, unknown>,
 ): ActionExecuteRequest {
+  const allowedIntegrations = new Set([
+    "polymarket",
+    "solana-wallet",
+    "evm-wallet",
+    "telegram",
+    "discord",
+    "other",
+  ]);
   const integrationId =
     typeof body.integrationId === "string" && body.integrationId.trim()
       ? body.integrationId.trim()
       : "other";
+  if (!allowedIntegrations.has(integrationId)) {
+    throw new MultiUserError(
+      "Unsupported integrationId",
+      422,
+      "INVALID_ACTION_REQUEST",
+    );
+  }
   const action =
     typeof body.action === "string" && body.action.trim()
       ? body.action.trim()
       : "tool.execute";
+  if (!/^[A-Za-z0-9_.:-]{1,120}$/.test(action)) {
+    throw new MultiUserError(
+      "Invalid action format",
+      422,
+      "INVALID_ACTION_REQUEST",
+    );
+  }
   const sessionId =
     typeof body.sessionId === "string" && body.sessionId.trim()
       ? body.sessionId.trim()
@@ -350,6 +372,10 @@ export class MultiUserService {
     string,
     PendingConfirmation
   >();
+  private readonly failedLoginAttempts = new Map<
+    string,
+    { count: number; lockUntilMs: number | null }
+  >();
   private readonly executionQueue = new InMemoryExecutionQueue<
     Record<string, unknown>
   >();
@@ -361,6 +387,8 @@ export class MultiUserService {
   private readonly quotaChatPerDay: number;
   private readonly quotaActionsPerDay: number;
   private readonly maxConfirmAttempts: number;
+  private readonly loginLockoutThreshold: number;
+  private readonly loginLockoutWindowMs: number;
   private readonly quotaCounters = new Map<string, number>();
   private readonly walletBindingByUserId = new Map<
     string,
@@ -401,6 +429,14 @@ export class MultiUserService {
     this.maxConfirmAttempts = Math.max(
       1,
       Number(process.env.MILAIDY_ACTION_CONFIRM_MAX_ATTEMPTS ?? "5"),
+    );
+    this.loginLockoutThreshold = Math.max(
+      3,
+      Number(process.env.MILAIDY_LOGIN_LOCKOUT_THRESHOLD ?? "5"),
+    );
+    this.loginLockoutWindowMs = Math.max(
+      60_000,
+      Number(process.env.MILAIDY_LOGIN_LOCKOUT_MS ?? "900000"),
     );
     this.quotaChatPerDay = Math.max(
       100,
@@ -1127,27 +1163,57 @@ export class MultiUserService {
       60_000,
     );
     const email = sanitizeEmail(input.email);
+    const lock = this.failedLoginAttempts.get(email);
+    if (lock?.lockUntilMs && lock.lockUntilMs > Date.now()) {
+      throw new MultiUserError(
+        "Too many failed login attempts. Try again later.",
+        429,
+        "LOGIN_LOCKED",
+        Math.max(1, Math.ceil((lock.lockUntilMs - Date.now()) / 1000)),
+      );
+    }
     const userId = this.userIdByEmail.get(email);
-    if (!userId)
-      throw new MultiUserError(
-        "Invalid credentials",
-        401,
-        "INVALID_CREDENTIALS",
-      );
-    const user = this.usersById.get(userId);
-    if (!user || user.disabledAt)
-      throw new MultiUserError(
-        "Invalid credentials",
-        401,
-        "INVALID_CREDENTIALS",
-      );
-    if (!verifyPassword(input.password, user.passwordHash)) {
+    if (!userId) {
+      const nextCount = (lock?.count ?? 0) + 1;
+      const lockUntilMs =
+        nextCount >= this.loginLockoutThreshold
+          ? Date.now() + this.loginLockoutWindowMs
+          : null;
+      this.failedLoginAttempts.set(email, { count: nextCount, lockUntilMs });
       throw new MultiUserError(
         "Invalid credentials",
         401,
         "INVALID_CREDENTIALS",
       );
     }
+    const user = this.usersById.get(userId);
+    if (!user || user.disabledAt) {
+      const nextCount = (lock?.count ?? 0) + 1;
+      const lockUntilMs =
+        nextCount >= this.loginLockoutThreshold
+          ? Date.now() + this.loginLockoutWindowMs
+          : null;
+      this.failedLoginAttempts.set(email, { count: nextCount, lockUntilMs });
+      throw new MultiUserError(
+        "Invalid credentials",
+        401,
+        "INVALID_CREDENTIALS",
+      );
+    }
+    if (!verifyPassword(input.password, user.passwordHash)) {
+      const nextCount = (lock?.count ?? 0) + 1;
+      const lockUntilMs =
+        nextCount >= this.loginLockoutThreshold
+          ? Date.now() + this.loginLockoutWindowMs
+          : null;
+      this.failedLoginAttempts.set(email, { count: nextCount, lockUntilMs });
+      throw new MultiUserError(
+        "Invalid credentials",
+        401,
+        "INVALID_CREDENTIALS",
+      );
+    }
+    this.failedLoginAttempts.delete(email);
 
     const sessionId = crypto.randomUUID();
     const tokens = this.issueTokens(user, sessionId);
@@ -1615,6 +1681,13 @@ export class MultiUserService {
     await this.enforceRateLimit(`actions:${userId}`, 90, 60_000);
     this.checkAndConsumeQuota(userId, "actions", 1);
     const settings = this.getSettings(userId);
+    if (!settings.policies.canUseTools) {
+      throw new MultiUserError(
+        "Tool execution is disabled for this account",
+        403,
+        "TOOLS_DISABLED",
+      );
+    }
     const integration = settings.integrations.find(
       (x) => x.integrationId === input.integrationId,
     );

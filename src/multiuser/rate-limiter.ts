@@ -220,7 +220,9 @@ export function createRateLimiter(): RateLimiter {
   const requireDistributed =
     process.env.MILAIDY_RATE_LIMIT_REQUIRE_DISTRIBUTED === "1" || strictProd;
   const failClosed =
-    process.env.MILAIDY_RATE_LIMIT_FAIL_CLOSED === "1" || strictProd;
+    isProductionRuntime ||
+    process.env.MILAIDY_RATE_LIMIT_FAIL_CLOSED === "1" ||
+    strictProd;
 
   const baseUrl =
     process.env.MILAIDY_REDIS_REST_URL?.trim() ??
