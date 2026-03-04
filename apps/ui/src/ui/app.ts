@@ -6410,7 +6410,7 @@ export class MilaidyApp extends LitElement {
           <main class="main">${this.renderView()}</main>
           <aside class="context-rail">${this.renderContextRail()}</aside>
         </div>
-        <footer>milaidy</footer>
+        <footer>Runtime, est. 2026</footer>
         ${this.renderActionConfirmModal()}
       </div>
     `;
