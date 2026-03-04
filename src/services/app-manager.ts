@@ -27,6 +27,7 @@ import type {
   RegistryPluginInfo,
   RegistrySearchResult,
 } from "./plugin-manager-types";
+import { getPluginInfo, getRegistryPlugins } from "./registry-client";
 
 const LOCAL_PLUGINS_DIR = "plugins";
 
@@ -43,6 +44,14 @@ const HYPERSCAPE_AUTH_MESSAGE_TYPE = "HYPERSCAPE_AUTH";
 const RS_2004SCAPE_APP_NAME = "@elizaos/app-2004scape";
 const RS_2004SCAPE_AUTH_MESSAGE_TYPE = "RS_2004SCAPE_AUTH";
 const SAFE_APP_URL_PROTOCOLS = new Set(["http:", "https:"]);
+const ALLOWED_APP_URL_TEMPLATE_KEYS = new Set([
+  // Public display identity only.
+  "BOT_NAME",
+  "RS_SDK_BOT_NAME",
+  // Non-secret endpoint routing values.
+  "HYPERSCAPE_CLIENT_URL",
+  "HYPERSCAPE_SERVER_URL",
+]);
 
 type AppViewerConfig = NonNullable<AppLaunchResult["viewer"]>;
 
@@ -70,6 +79,20 @@ interface ActiveAppSession {
 function resolvePluginPackageName(appInfo: RegistryPluginInfo): string {
   const npmPackage = appInfo.npm.package.trim();
   return npmPackage && npmPackage.length > 0 ? npmPackage : appInfo.name;
+}
+
+function mergeAppMeta(
+  appInfo: RegistryPluginInfo,
+  meta: RegistryPluginInfo["appMeta"],
+): void {
+  if (!meta) return;
+  appInfo.viewer = meta.viewer ?? appInfo.viewer;
+  appInfo.launchUrl = meta.launchUrl ?? appInfo.launchUrl;
+  appInfo.launchType = meta.launchType ?? appInfo.launchType;
+  appInfo.displayName = meta.displayName ?? appInfo.displayName;
+  appInfo.category = meta.category ?? appInfo.category;
+  appInfo.capabilities = meta.capabilities ?? appInfo.capabilities;
+  appInfo.icon = meta.icon ?? appInfo.icon;
 }
 
 function isAutoInstallable(appInfo: RegistryPluginInfo): boolean {
@@ -128,6 +151,10 @@ function getTemplateFallbackValue(key: string): string | undefined {
 
 function substituteTemplateVars(raw: string): string {
   return raw.replace(/\{([A-Z0-9_]+)\}/g, (_full, key: string) => {
+    if (!ALLOWED_APP_URL_TEMPLATE_KEYS.has(key)) {
+      return getTemplateFallbackValue(key) ?? "";
+    }
+
     const value = process.env[key];
     if (value && value.trim().length > 0) {
       return value.trim();
@@ -444,11 +471,40 @@ export class AppManager {
     pluginManager: PluginManagerLike,
   ): Promise<RegistryPluginInfo[]> {
     const registry = await pluginManager.refreshRegistry();
-    // Filter to only include app packages (those with "/app-" in the name)
-    return Array.from(registry.values()).filter((plugin) => {
+    // Merge in local workspace app entries that are discovered by our
+    // registry-client but not by the elizaos
+    // plugin-manager service.
+    try {
+      const localRegistry = await getRegistryPlugins();
+      for (const [name, info] of localRegistry) {
+        if (!registry.has(name) && info.kind === "app") {
+          registry.set(name, info);
+        }
+      }
+    } catch {
+      // local discovery is best-effort
+    }
+    // Include app packages: those with "/app-" in the name OR kind === "app"
+    const apps = Array.from(registry.values()).filter((plugin) => {
+      if (plugin.kind === "app") return true;
       const name = plugin.name.toLowerCase();
       const npmPackage = plugin.npm.package.toLowerCase();
       return name.includes("/app-") || npmPackage.includes("/app-");
+    });
+    // Flatten appMeta into top-level fields for the frontend
+    return apps.map((p) => {
+      const meta = p.appMeta;
+      if (!meta) return p;
+      return {
+        ...p,
+        displayName: meta.displayName,
+        launchType: meta.launchType,
+        launchUrl: meta.launchUrl,
+        icon: meta.icon,
+        category: meta.category,
+        capabilities: meta.capabilities,
+        viewer: meta.viewer,
+      };
     });
   }
 
@@ -488,9 +544,27 @@ export class AppManager {
     onProgress?: (progress: InstallProgressLike) => void,
     runtime?: IAgentRuntime | null,
   ): Promise<AppLaunchResult> {
-    const appInfo = (await pluginManager.getRegistryPlugin(
+    let appInfo = (await pluginManager.getRegistryPlugin(
       name,
     )) as RegistryAppPlugin | null;
+    // Supplement with local registry metadata since the elizaos plugin-manager
+    // service doesn't include our local workspace app discovery.
+    try {
+      const localInfo = await getPluginInfo(name);
+      if (localInfo) {
+        const meta = localInfo.appMeta;
+        if (!appInfo) {
+          appInfo = { ...localInfo } as RegistryAppPlugin;
+          mergeAppMeta(appInfo, meta);
+        } else if (meta && !appInfo.viewer) {
+          // Merge local metadata into existing registry entry
+          mergeAppMeta(appInfo, meta);
+          appInfo.kind = localInfo.kind ?? appInfo.kind;
+        }
+      }
+    } catch {
+      // local lookup is best-effort
+    }
     if (!appInfo) {
       throw new Error(`App "${name}" not found in the registry.`);
     }
@@ -542,7 +616,24 @@ export class AppManager {
 
     // Auto-provision hyperscape agent if needed
     if (name === HYPERSCAPE_APP_NAME) {
-      await autoProvisionHyperscapeAgent(runtime);
+      const provisionResult = await autoProvisionHyperscapeAgent(runtime);
+      // If auto-provisioning failed and no credentials exist, don't launch viewer
+      if (
+        !provisionResult &&
+        !process.env.HYPERSCAPE_CHARACTER_ID?.trim() &&
+        !process.env.HYPERSCAPE_AUTH_TOKEN?.trim()
+      ) {
+        logger.warn(
+          "[app-manager] Hyperscape requires authentication but auto-provisioning failed. " +
+            "Set HYPERSCAPE_CHARACTER_ID and HYPERSCAPE_AUTH_TOKEN, or ensure the hyperscape server is running.",
+        );
+        throw new Error(
+          "Hyperscape authentication required. Set HYPERSCAPE_CHARACTER_ID and HYPERSCAPE_AUTH_TOKEN, " +
+            "or ensure the hyperscape server is running at " +
+            (process.env.HYPERSCAPE_SERVER_URL || "localhost:5555") +
+            " for auto-provisioning.",
+        );
+      }
     }
 
     // Build viewer config from registry app metadata
@@ -642,7 +733,7 @@ export class AppManager {
     pluginManager: PluginManagerLike,
   ): Promise<InstalledAppInfo[]> {
     const installed = await pluginManager.listInstalledPlugins();
-    // Filter to only include app plugins
+    // Filter to only include app plugins (by name convention or known game plugins)
     const appPlugins = installed.filter((p: InstalledPluginInfo) => {
       const name = p.name.toLowerCase();
       return name.includes("/app-");

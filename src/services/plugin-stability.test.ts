@@ -15,6 +15,7 @@
 import type { Plugin, Provider, ProviderResult } from "@elizaos/core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { validateRuntimeContext } from "../api/plugin-validation";
+import { CONNECTOR_PLUGINS } from "../config/plugin-auto-enable";
 import type { MiladyConfig } from "../config/types.milady";
 import { createSessionKeyProvider } from "../providers/session-bridge";
 import { createWorkspaceProvider } from "../providers/workspace-provider";
@@ -49,20 +50,7 @@ function _getCoreOverride(pkg: RootPackageJson): string | undefined {
 // Constants — Full plugin enumeration
 // ---------------------------------------------------------------------------
 // CORE_PLUGINS and OPTIONAL_CORE_PLUGINS are imported from eliza.ts
-
-/** Connector plugins (loaded when connector config is present). */
-const CONNECTOR_PLUGINS: Record<string, string> = {
-  discord: "@elizaos/plugin-discord",
-  telegram: "@elizaos/plugin-telegram",
-  slack: "@elizaos/plugin-slack",
-  whatsapp: "@elizaos/plugin-whatsapp",
-  signal: "@elizaos/plugin-signal",
-  imessage: "@elizaos/plugin-imessage",
-  bluebubbles: "@elizaos/plugin-bluebubbles",
-  msteams: "@elizaos/plugin-msteams",
-  mattermost: "@elizaos/plugin-mattermost",
-  googlechat: "@elizaos/plugin-google-chat",
-};
+// CONNECTOR_PLUGINS is imported from ../config/plugin-auto-enable (canonical source)
 
 /** Model-provider plugins (loaded when env key is set). */
 const PROVIDER_PLUGINS: Record<string, string> = {
@@ -120,6 +108,7 @@ const envKeysToClean = [
   "OLLAMA_BASE_URL",
   "ELIZAOS_CLOUD_API_KEY",
   "ELIZAOS_CLOUD_ENABLED",
+  "MILAIDY_USE_PI_AI",
   "DISCORD_BOT_TOKEN",
   "TELEGRAM_BOT_TOKEN",
   "SLACK_BOT_TOKEN",
@@ -141,11 +130,25 @@ describe("Plugin Enumeration", () => {
     }
   });
 
+  it("declares every core plugin in root package dependencies", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { resolve } = await import("node:path");
+    const pkgPath = resolve(process.cwd(), "package.json");
+    const pkg = JSON.parse(await readFile(pkgPath, "utf-8")) as RootPackageJson;
+
+    for (const pluginName of CORE_PLUGINS) {
+      expect(
+        pkg.dependencies[pluginName],
+        `${pluginName} is missing from package.json dependencies`,
+      ).toBeDefined();
+    }
+  });
+
   it("lists all connector plugins", () => {
-    expect(Object.keys(CONNECTOR_PLUGINS).length).toBe(10);
+    expect(Object.keys(CONNECTOR_PLUGINS).length).toBeGreaterThanOrEqual(17);
     for (const [connector, pluginName] of Object.entries(CONNECTOR_PLUGINS)) {
       expect(typeof connector).toBe("string");
-      expect(pluginName).toMatch(/^@elizaos\/plugin-/);
+      expect(pluginName).toMatch(/^@(elizaos|milady)\/plugin-/);
     }
   });
 
@@ -171,9 +174,12 @@ describe("Plugin Enumeration", () => {
       "@elizaos/skills",
       "@elizaos/tui",
     ]);
-    // All enumerated plugins should be valid package names
+    // All enumerated plugins should be valid scoped package names
     for (const name of ALL_KNOWN_PLUGINS) {
-      expect(name.startsWith("@elizaos/plugin-")).toBe(true);
+      expect(
+        name.startsWith("@elizaos/plugin-") ||
+          name.startsWith("@milady/plugin-"),
+      ).toBe(true);
     }
     expect(knownPackages.size).toBeGreaterThan(0);
   });
@@ -612,13 +618,13 @@ describe("Provider Validation", () => {
     expect(provider.name).toBe("workspaceContext");
   });
 
-  it.skip("createSessionKeyProvider returns a valid Provider shape", () => {
+  it("createSessionKeyProvider returns a valid Provider shape", () => {
     const provider = createSessionKeyProvider({ defaultAgentId: "test-agent" });
     expect(provider).toBeDefined();
     expect(typeof provider.name).toBe("string");
     expect(typeof provider.description).toBe("string");
     expect(typeof provider.get).toBe("function");
-    expect(provider.name).toBe("session-key");
+    expect(provider.name).toBe("miladySessionKey");
   });
 
   it("createMiladyPlugin returns a valid Plugin with providers", () => {
@@ -968,26 +974,10 @@ describe("Version Skew Detection (issue #10)", () => {
   });
 
   it("plugin-trajectory-logger exports a runtime service", async () => {
-    let mod: {
+    const mod = (await import("@elizaos/plugin-trajectory-logger")) as {
       default?: Plugin;
       TrajectoryLoggerService?: unknown;
     };
-    try {
-      mod = (await import("@elizaos/plugin-trajectory-logger")) as {
-        default?: Plugin;
-        TrajectoryLoggerService?: unknown;
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // CI/dev environments may omit this optional package; keep the skew check
-      // non-blocking when the module is not installed.
-      if (
-        message.includes("Cannot find package '@elizaos/plugin-trajectory-logger'")
-      ) {
-        return;
-      }
-      throw error;
-    }
     const plugin = mod.default;
     expect(plugin).toBeDefined();
     expect(Array.isArray(plugin?.services)).toBe(true);

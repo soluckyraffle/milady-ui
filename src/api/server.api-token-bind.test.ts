@@ -1,22 +1,25 @@
 import { logger } from "@elizaos/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureApiTokenForBindHost, getConfiguredLegacyApiToken } from "./server";
+import { ensureApiTokenForBindHost } from "./server";
 
 describe("ensureApiTokenForBindHost", () => {
   const previousToken = process.env.MILADY_API_TOKEN;
-  const previousCompatToken = process.env.MILAIDY_API_TOKEN;
 
   afterEach(() => {
     if (previousToken === undefined) delete process.env.MILADY_API_TOKEN;
     else process.env.MILADY_API_TOKEN = previousToken;
-    if (previousCompatToken === undefined) delete process.env.MILAIDY_API_TOKEN;
-    else process.env.MILAIDY_API_TOKEN = previousCompatToken;
     vi.restoreAllMocks();
   });
 
-  it("does not generate a token on loopback bind hosts", () => {
+  it.each([
+    "127.0.0.1",
+    "localhost:2138",
+    "[::1]:2138",
+    "http://localhost:2138",
+    "0:0:0:0:0:0:0:1",
+  ])("does not generate a token on loopback bind hosts (%s)", (host) => {
     delete process.env.MILADY_API_TOKEN;
-    ensureApiTokenForBindHost("127.0.0.1");
+    ensureApiTokenForBindHost(host);
     expect(process.env.MILADY_API_TOKEN).toBeUndefined();
   });
 
@@ -30,7 +33,7 @@ describe("ensureApiTokenForBindHost", () => {
     delete process.env.MILADY_API_TOKEN;
     const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 
-    ensureApiTokenForBindHost("0.0.0.0");
+    ensureApiTokenForBindHost("0.0.0.0:2138");
 
     const generated = process.env.MILADY_API_TOKEN ?? "";
     expect(generated).toMatch(/^[a-f0-9]{64}$/);
@@ -41,17 +44,5 @@ describe("ensureApiTokenForBindHost", () => {
     expect(loggedMessages.some((message) => message.includes(generated))).toBe(
       false,
     );
-  });
-
-  it("accepts compat token name for legacy auth", () => {
-    delete process.env.MILADY_API_TOKEN;
-    process.env.MILAIDY_API_TOKEN = "compat-token";
-    expect(getConfiguredLegacyApiToken()).toBe("compat-token");
-  });
-
-  it("prefers canonical token over compat token when both are set", () => {
-    process.env.MILADY_API_TOKEN = "canonical-token";
-    process.env.MILAIDY_API_TOKEN = "compat-token";
-    expect(getConfiguredLegacyApiToken()).toBe("canonical-token");
   });
 });

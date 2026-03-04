@@ -19,13 +19,17 @@ import {
   type ServiceTypeName,
   type State,
 } from "@elizaos/core";
+import {
+  PluginManagerService,
+  pluginRegistry,
+} from "@elizaos/plugin-plugin-manager";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppManager } from "./app-manager";
 import type {
-  InstalledPluginInfo,
   PluginManagerLike,
   RegistryPluginInfo,
 } from "./plugin-manager-types";
+import * as registryClient from "./registry-client";
 
 // Fake Runtime implementation
 class FakeAgentRuntime implements IAgentRuntime {
@@ -312,122 +316,50 @@ class FakeAgentRuntime implements IAgentRuntime {
 
 describe("AppManager Integration", () => {
   let appManager: AppManager;
-  let pluginManager: PluginManagerLike;
+  let pluginManager: PluginManagerService;
+  let runtime: FakeAgentRuntime;
   let tempDir: string;
 
   const APP_NAME = "@elizaos/app-example";
   const APP_PLUGIN_NAME = "@elizaos/plugin-example";
-  const installedPathFor = (pluginName: string): string => path.join(
-    tempDir,
-    "plugins",
-    "installed",
-    `_${pluginName.replace("@", "").replace("/", "_")}`,
-  );
-
-  const registryEntryFor = (name: string): RegistryPluginInfo => ({
-    name,
-    gitRepo: "elizaos/app-example",
-    gitUrl: "https://github.com/elizaos/app-example",
-    description: "An example app",
-    topics: ["app"],
-    stars: 10,
-    language: "TypeScript",
-    npm: { package: APP_PLUGIN_NAME, v2Version: "1.0.0" },
-    supports: { v0: true, v1: false, v2: false },
-  });
-
-  const listInstalled = (pluginsDir: string): InstalledPluginInfo[] => {
-    const installedDir = path.join(pluginsDir, "installed");
-    if (!fs.existsSync(installedDir)) return [];
-    return fs
-      .readdirSync(installedDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => {
-        const pkgPath = path.join(installedDir, entry.name, "package.json");
-        if (!fs.existsSync(pkgPath)) return null;
-        try {
-          const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
-            name?: string;
-            version?: string;
-          };
-          if (!parsed.name) return null;
-          return { name: parsed.name, version: parsed.version };
-        } catch {
-          return null;
-        }
-      })
-      .filter((row): row is InstalledPluginInfo => row !== null);
-  };
-
-  const createPluginManagerMock = (pluginsDir: string): PluginManagerLike => ({
-    refreshRegistry: async () =>
-      new Map([
-        [APP_NAME, registryEntryFor(APP_NAME)],
-        [APP_PLUGIN_NAME, registryEntryFor(APP_PLUGIN_NAME)],
-      ]),
-    listInstalledPlugins: async () => listInstalled(pluginsDir),
-    getRegistryPlugin: async (name: string) => {
-      if (name === APP_NAME || name === APP_PLUGIN_NAME) {
-        return registryEntryFor(name);
-      }
-      return null;
-    },
-    searchRegistry: async () => [],
-    installPlugin: async (pluginName: string) => {
-      const installDir = path.join(
-        pluginsDir,
-        "installed",
-        `_${pluginName.replace("@", "").replace("/", "_")}`,
-      );
-      fs.mkdirSync(installDir, { recursive: true });
-      fs.writeFileSync(
-        path.join(installDir, "package.json"),
-        JSON.stringify({ name: pluginName, version: "1.0.0" }),
-      );
-      return {
-        success: true,
-        pluginName,
-        version: "1.0.0",
-        installPath: installDir,
-        requiresRestart: true,
-      };
-    },
-    uninstallPlugin: async (pluginName: string) => {
-      const installDir = path.join(
-        pluginsDir,
-        "installed",
-        `_${pluginName.replace("@", "").replace("/", "_")}`,
-      );
-      fs.rmSync(installDir, { recursive: true, force: true });
-      return { success: true, pluginName, requiresRestart: true };
-    },
-    listEjectedPlugins: async () => [],
-    ejectPlugin: async (pluginName: string) => ({
-      success: true,
-      pluginName,
-      ejectedPath: "",
-      requiresRestart: true,
-    }),
-    syncPlugin: async (pluginName: string) => ({
-      success: true,
-      pluginName,
-      ejectedPath: "",
-      requiresRestart: false,
-    }),
-    reinjectPlugin: async (pluginName: string) => ({
-      success: true,
-      pluginName,
-      removedPath: "",
-      requiresRestart: true,
-    }),
-  });
 
   beforeEach(async () => {
     // Setup temp directory for plugins
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "milady-test-"));
     const pluginsDir = path.join(tempDir, "plugins");
     fs.mkdirSync(pluginsDir);
-    pluginManager = createPluginManagerMock(pluginsDir);
+
+    // Mock registry response
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        registry: {
+          [APP_NAME]: {
+            git: { repo: "elizaos/app-example", v0: {}, v1: {}, v2: {} },
+            npm: { repo: APP_PLUGIN_NAME, v0: null, v1: null, v2: "1.0.0" },
+            supports: { v0: true, v1: false, v2: false },
+            description: "An example app",
+            topics: ["app"],
+            stargazers_count: 10,
+            language: "TypeScript",
+          },
+          // Add the plugin entry so uninstallPlugin can find it
+          [APP_PLUGIN_NAME]: {
+            git: { repo: "elizaos/plugin-example", v0: {}, v1: {}, v2: {} },
+            npm: { repo: APP_PLUGIN_NAME, v0: null, v1: null, v2: "1.0.0" },
+            supports: { v0: true, v1: false, v2: false },
+            description: "An example plugin",
+            topics: ["plugin"],
+          },
+        },
+      }),
+    });
+
+    runtime = new FakeAgentRuntime();
+    // Initialize PluginManager with real file system path
+    pluginManager = new PluginManagerService(runtime, {
+      pluginDirectory: pluginsDir,
+    });
 
     process.env.MILADY_STATE_DIR = tempDir;
 
@@ -442,7 +374,13 @@ describe("AppManager Integration", () => {
 
   it("launches an app directly if plugin is already installed", async () => {
     // Setup: Simulate installed plugin
-    const installedDir = installedPathFor(APP_PLUGIN_NAME);
+    // Use hyphen in sanitized name as verified
+    const installedDir = path.join(
+      tempDir,
+      "plugins",
+      "installed",
+      "_elizaos_plugin-example",
+    );
     fs.mkdirSync(installedDir, { recursive: true });
     fs.writeFileSync(
       path.join(installedDir, "package.json"),
@@ -477,7 +415,13 @@ describe("AppManager Integration", () => {
 
   it("stops an app by uninstalling its plugin", async () => {
     // Setup: Simulate installed plugin
-    const installedDir = installedPathFor(APP_PLUGIN_NAME);
+    // Use hyphen in sanitized name as verified
+    const installedDir = path.join(
+      tempDir,
+      "plugins",
+      "installed",
+      "_elizaos_plugin-example",
+    );
     fs.mkdirSync(installedDir, { recursive: true });
     fs.writeFileSync(
       path.join(installedDir, "package.json"),
@@ -493,5 +437,387 @@ describe("AppManager Integration", () => {
 
     // Verify file system
     expect(fs.existsSync(installedDir)).toBe(false);
+  });
+});
+
+describe("Hyperscape Auto-Provisioning", () => {
+  let appManager: AppManager;
+  let pluginManager: PluginManagerService;
+  let runtime: FakeAgentRuntime;
+  let tempDir: string;
+  let originalEnv: Record<string, string | undefined>;
+
+  const HYPERSCAPE_APP_NAME = "@elizaos/app-hyperscape";
+  const HYPERSCAPE_PLUGIN_NAME = "@elizaos/plugin-hyperscape";
+
+  beforeEach(async () => {
+    // Flush any cached registry from prior test suites so fresh fetch mocks
+    // installed in individual tests are honoured.
+    pluginRegistry.resetRegistryCache();
+
+    // Save original env vars
+    originalEnv = {
+      HYPERSCAPE_CHARACTER_ID: process.env.HYPERSCAPE_CHARACTER_ID,
+      HYPERSCAPE_AUTH_TOKEN: process.env.HYPERSCAPE_AUTH_TOKEN,
+      HYPERSCAPE_SERVER_URL: process.env.HYPERSCAPE_SERVER_URL,
+      SOLANA_PRIVATE_KEY: process.env.SOLANA_PRIVATE_KEY,
+      EVM_PRIVATE_KEY: process.env.EVM_PRIVATE_KEY,
+    };
+
+    // Clear hyperscape env vars
+    delete process.env.HYPERSCAPE_CHARACTER_ID;
+    delete process.env.HYPERSCAPE_AUTH_TOKEN;
+    delete process.env.SOLANA_PRIVATE_KEY;
+    delete process.env.EVM_PRIVATE_KEY;
+
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "milady-hyperscape-test-"));
+    const pluginsDir = path.join(tempDir, "plugins");
+    fs.mkdirSync(pluginsDir);
+
+    runtime = new FakeAgentRuntime();
+    pluginManager = new PluginManagerService(runtime, {
+      pluginDirectory: pluginsDir,
+    });
+
+    process.env.MILADY_STATE_DIR = tempDir;
+    appManager = new AppManager();
+  });
+
+  afterEach(() => {
+    // Restore original env vars
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it("throws error when hyperscape auto-provisioning fails and no credentials exist", async () => {
+    // Mock registry to return hyperscape app
+    global.fetch = vi.fn().mockImplementation((url: string) => {
+      if (url.includes("wallet-auth")) {
+        // Simulate server not responding
+        return Promise.reject(new Error("ECONNREFUSED"));
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          registry: {
+            [HYPERSCAPE_APP_NAME]: {
+              git: { repo: "elizaos/app-hyperscape", v0: {}, v1: {}, v2: {} },
+              npm: {
+                repo: HYPERSCAPE_PLUGIN_NAME,
+                v0: null,
+                v1: null,
+                v2: "1.0.0",
+              },
+              supports: { v0: true, v1: false, v2: false },
+              description: "Hyperscape 3D world",
+              topics: ["app"],
+            },
+            [HYPERSCAPE_PLUGIN_NAME]: {
+              git: {
+                repo: "elizaos/plugin-hyperscape",
+                v0: {},
+                v1: {},
+                v2: {},
+              },
+              npm: {
+                repo: HYPERSCAPE_PLUGIN_NAME,
+                v0: null,
+                v1: null,
+                v2: "1.0.0",
+              },
+              supports: { v0: true, v1: false, v2: false },
+              description: "Hyperscape plugin",
+              topics: ["plugin"],
+            },
+          },
+        }),
+      });
+    });
+
+    // Simulate plugin already installed
+    const installedDir = path.join(
+      tempDir,
+      "plugins",
+      "installed",
+      "_elizaos_plugin-hyperscape",
+    );
+    fs.mkdirSync(installedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(installedDir, "package.json"),
+      JSON.stringify({ name: HYPERSCAPE_PLUGIN_NAME, version: "1.0.0" }),
+    );
+
+    // No wallet keys set, auto-provisioning will fail
+    await expect(
+      appManager.launch(pluginManager, HYPERSCAPE_APP_NAME),
+    ).rejects.toThrow(/Hyperscape authentication required/);
+  });
+
+  it("succeeds when hyperscape credentials are pre-configured", async () => {
+    // Pre-set credentials
+    process.env.HYPERSCAPE_CHARACTER_ID = "test-char-id";
+    process.env.HYPERSCAPE_AUTH_TOKEN = "test-auth-token";
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        registry: {
+          [HYPERSCAPE_APP_NAME]: {
+            git: { repo: "elizaos/app-hyperscape", v0: {}, v1: {}, v2: {} },
+            npm: {
+              repo: HYPERSCAPE_PLUGIN_NAME,
+              v0: null,
+              v1: null,
+              v2: "1.0.0",
+            },
+            supports: { v0: true, v1: false, v2: false },
+            description: "Hyperscape 3D world",
+            topics: ["app"],
+          },
+          [HYPERSCAPE_PLUGIN_NAME]: {
+            git: { repo: "elizaos/plugin-hyperscape", v0: {}, v1: {}, v2: {} },
+            npm: {
+              repo: HYPERSCAPE_PLUGIN_NAME,
+              v0: null,
+              v1: null,
+              v2: "1.0.0",
+            },
+            supports: { v0: true, v1: false, v2: false },
+            description: "Hyperscape plugin",
+            topics: ["plugin"],
+          },
+        },
+      }),
+    });
+
+    // Simulate plugin already installed
+    const installedDir = path.join(
+      tempDir,
+      "plugins",
+      "installed",
+      "_elizaos_plugin-hyperscape",
+    );
+    fs.mkdirSync(installedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(installedDir, "package.json"),
+      JSON.stringify({ name: HYPERSCAPE_PLUGIN_NAME, version: "1.0.0" }),
+    );
+
+    const result = await appManager.launch(pluginManager, HYPERSCAPE_APP_NAME);
+    expect(result.pluginInstalled).toBe(true);
+  });
+
+  it("skips auto-provisioning when credentials already exist", async () => {
+    // Pre-set credentials - auto-provisioning should be skipped
+    process.env.HYPERSCAPE_CHARACTER_ID = "existing-char-id";
+    process.env.HYPERSCAPE_AUTH_TOKEN = "existing-auth-token";
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        registry: {
+          [HYPERSCAPE_APP_NAME]: {
+            git: { repo: "elizaos/app-hyperscape", v0: {}, v1: {}, v2: {} },
+            npm: {
+              repo: HYPERSCAPE_PLUGIN_NAME,
+              v0: null,
+              v1: null,
+              v2: "1.0.0",
+            },
+            supports: { v0: true, v1: false, v2: false },
+            description: "Hyperscape 3D world",
+            topics: ["app"],
+          },
+          [HYPERSCAPE_PLUGIN_NAME]: {
+            git: {
+              repo: "elizaos/plugin-hyperscape",
+              v0: {},
+              v1: {},
+              v2: {},
+            },
+            npm: {
+              repo: HYPERSCAPE_PLUGIN_NAME,
+              v0: null,
+              v1: null,
+              v2: "1.0.0",
+            },
+            supports: { v0: true, v1: false, v2: false },
+            description: "Hyperscape plugin",
+            topics: ["plugin"],
+          },
+        },
+      }),
+    });
+
+    // Simulate plugin already installed
+    const installedDir = path.join(
+      tempDir,
+      "plugins",
+      "installed",
+      "_elizaos_plugin-hyperscape",
+    );
+    fs.mkdirSync(installedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(installedDir, "package.json"),
+      JSON.stringify({ name: HYPERSCAPE_PLUGIN_NAME, version: "1.0.0" }),
+    );
+
+    const result = await appManager.launch(pluginManager, HYPERSCAPE_APP_NAME);
+    expect(result.pluginInstalled).toBe(true);
+    // Credentials should remain unchanged (auto-provisioning skipped)
+    expect(process.env.HYPERSCAPE_CHARACTER_ID).toBe("existing-char-id");
+    expect(process.env.HYPERSCAPE_AUTH_TOKEN).toBe("existing-auth-token");
+  });
+});
+
+describe("App URL template security", () => {
+  let originalEnv: Record<string, string | undefined>;
+
+  function createRegistryApp(
+    overrides: Partial<RegistryPluginInfo> = {},
+  ): RegistryPluginInfo {
+    return {
+      name: "@elizaos/app-security-test",
+      gitRepo: "elizaos/app-security-test",
+      gitUrl: "https://github.com/elizaos/app-security-test",
+      description: "security test app",
+      topics: ["app"],
+      stars: 0,
+      language: "TypeScript",
+      launchType: "connect",
+      launchUrl: null,
+      kind: "app",
+      npm: {
+        package: "@elizaos/plugin-security-test",
+        v0Version: "1.0.0",
+        v1Version: null,
+        v2Version: null,
+      },
+      supports: { v0: true, v1: false, v2: false },
+      ...overrides,
+    };
+  }
+
+  function createPluginManagerStub(
+    appInfo: RegistryPluginInfo,
+  ): PluginManagerLike {
+    const pluginName = appInfo.npm.package;
+    return {
+      refreshRegistry: vi
+        .fn()
+        .mockResolvedValue(new Map<string, RegistryPluginInfo>()),
+      listInstalledPlugins: vi
+        .fn()
+        .mockResolvedValue([{ name: pluginName, version: "1.0.0" }]),
+      getRegistryPlugin: vi.fn().mockResolvedValue(appInfo),
+      searchRegistry: vi.fn().mockResolvedValue([]),
+      installPlugin: vi.fn().mockResolvedValue({
+        success: true,
+        pluginName,
+        version: "1.0.0",
+        installPath: "/tmp",
+        requiresRestart: true,
+      }),
+      uninstallPlugin: vi.fn().mockResolvedValue({
+        success: true,
+        pluginName,
+        requiresRestart: true,
+      }),
+      listEjectedPlugins: vi.fn().mockResolvedValue([]),
+      ejectPlugin: vi.fn().mockResolvedValue({
+        success: true,
+        pluginName,
+        ejectedPath: "/tmp",
+        requiresRestart: false,
+      }),
+      syncPlugin: vi.fn().mockResolvedValue({
+        success: true,
+        pluginName,
+        ejectedPath: "/tmp",
+        requiresRestart: false,
+      }),
+      reinjectPlugin: vi.fn().mockResolvedValue({
+        success: true,
+        pluginName,
+        removedPath: "/tmp",
+        requiresRestart: false,
+      }),
+    };
+  }
+
+  beforeEach(() => {
+    originalEnv = {
+      BOT_NAME: process.env.BOT_NAME,
+      MILADY_API_TOKEN: process.env.MILADY_API_TOKEN,
+    };
+    vi.spyOn(registryClient, "getPluginInfo").mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    vi.restoreAllMocks();
+  });
+
+  it("does not interpolate non-allowlisted env vars into app URLs", async () => {
+    process.env.BOT_NAME = "allowlisted-bot";
+    process.env.MILADY_API_TOKEN = "super-secret-token";
+    const appInfo = createRegistryApp({
+      launchUrl:
+        "https://launch.example/?bot={BOT_NAME}&token={MILADY_API_TOKEN}",
+      viewer: {
+        url: "https://viewer.example/play?bot={BOT_NAME}&token={MILADY_API_TOKEN}",
+        embedParams: { session: "{MILADY_API_TOKEN}" },
+      },
+    });
+
+    const appManager = new AppManager();
+    const result = await appManager.launch(
+      createPluginManagerStub(appInfo),
+      appInfo.name,
+    );
+
+    expect(result.launchUrl).toBe(
+      "https://launch.example/?bot=allowlisted-bot&token=",
+    );
+    expect(result.viewer?.url).toBeDefined();
+    expect(result.viewer?.url).not.toContain("super-secret-token");
+
+    const viewerUrl = new URL(result.viewer?.url ?? "https://viewer.example");
+    expect(viewerUrl.searchParams.get("bot")).toBe("allowlisted-bot");
+    expect(viewerUrl.searchParams.get("token")).toBe("");
+    expect(viewerUrl.searchParams.get("session")).toBe("");
+  });
+
+  it("still interpolates allowlisted env vars", async () => {
+    process.env.BOT_NAME = "test-agent";
+    const appInfo = createRegistryApp({
+      launchUrl: "https://launch.example/?bot={BOT_NAME}",
+      viewer: {
+        url: "https://viewer.example/play?bot={BOT_NAME}",
+      },
+    });
+
+    const appManager = new AppManager();
+    const result = await appManager.launch(
+      createPluginManagerStub(appInfo),
+      appInfo.name,
+    );
+
+    expect(result.launchUrl).toBe("https://launch.example/?bot=test-agent");
+    const viewerUrl = new URL(result.viewer?.url ?? "https://viewer.example");
+    expect(viewerUrl.searchParams.get("bot")).toBe("test-agent");
   });
 });

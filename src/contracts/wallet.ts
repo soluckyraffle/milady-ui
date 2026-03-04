@@ -83,16 +83,6 @@ export interface WalletConfigStatus {
   ankrKeySet: boolean;
   heliusKeySet: boolean;
   birdeyeKeySet: boolean;
-  evmPublicSource?: boolean;
-  solanaPublicSource?: boolean;
-  pricePublicSource?: boolean;
-  solanaWalletConnected?: boolean;
-  walletConnectionLocked?: boolean;
-  evmConfiguredAddress?: string | null;
-  solanaConfiguredAddress?: string | null;
-  evmSigningEnabled?: boolean;
-  solanaSigningEnabled?: boolean;
-  walletExportEnabled?: boolean;
   evmChains: string[];
   evmAddress: string | null;
   solanaAddress: string | null;

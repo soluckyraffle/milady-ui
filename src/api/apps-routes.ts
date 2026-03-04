@@ -33,6 +33,7 @@ export interface AppsRouteContext
 }
 
 function isNonAppRegistryPlugin(plugin: RegistryPluginInfo): boolean {
+  if (plugin.kind === "app") return false;
   const name = plugin.name.toLowerCase();
   const npmPackage = plugin.npm.package.toLowerCase();
   return !name.includes("/app-") && !npmPackage.includes("/app-");
@@ -91,20 +92,24 @@ export async function handleAppsRoutes(
 
   // Launch an app: install its plugin (if needed), return viewer config.
   if (method === "POST" && pathname === "/api/apps/launch") {
-    const body = await readJsonBody<{ name?: string }>(req, res);
-    if (!body) return true;
-    if (!body.name?.trim()) {
-      error(res, "name is required");
-      return true;
+    try {
+      const body = await readJsonBody<{ name?: string }>(req, res);
+      if (!body) return true;
+      if (!body.name?.trim()) {
+        error(res, "name is required");
+        return true;
+      }
+      const pluginManager = getPluginManager();
+      const result = await appManager.launch(
+        pluginManager,
+        body.name.trim(),
+        (_progress: InstallProgressLike) => {},
+        runtime,
+      );
+      json(res, result);
+    } catch (e) {
+      error(res, e instanceof Error ? e.message : "Failed to launch app", 500);
     }
-    const pluginManager = getPluginManager();
-    const result = await appManager.launch(
-      pluginManager,
-      body.name.trim(),
-      (_progress: InstallProgressLike) => {},
-      runtime,
-    );
-    json(res, result);
     return true;
   }
 

@@ -10,13 +10,6 @@ export interface AuthRouteContext extends RouteRequestContext {
   clearPairing: () => void;
 }
 
-function getConfiguredApiToken(): string | null {
-  const primary = process.env.MILADY_API_TOKEN?.trim();
-  if (primary) return primary;
-  const compat = process.env.MILAIDY_API_TOKEN?.trim();
-  return compat || null;
-}
-
 export async function handleAuthRoutes(
   ctx: AuthRouteContext,
 ): Promise<boolean> {
@@ -40,7 +33,7 @@ export async function handleAuthRoutes(
 
   // ── GET /api/auth/status ───────────────────────────────────────────────
   if (method === "GET" && pathname === "/api/auth/status") {
-    const required = Boolean(getConfiguredApiToken());
+    const required = Boolean(process.env.MILADY_API_TOKEN?.trim());
     const enabled = pairingEnabled();
     if (enabled) ensurePairingCode();
     json(res, {
@@ -56,7 +49,7 @@ export async function handleAuthRoutes(
     const body = await readJsonBody<{ code?: string }>(req, res);
     if (!body) return true;
 
-    const token = getConfiguredApiToken();
+    const token = process.env.MILADY_API_TOKEN?.trim();
     if (!token) {
       error(res, "Pairing not enabled", 400);
       return true;
